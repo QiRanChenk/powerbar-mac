@@ -15,7 +15,7 @@ Sister tool of the powerbar in [MECHREVO-WUJIE15XA-8745HS-Hackintosh](https://gi
 ## 功能 / Features
 
 - **电源**：菜单栏显示电池功率（`⚡︎+12.3W` 充电 / `-8.1W` 放电）；面板里有电量、预计剩余或充满时间、整机功耗（`PowerTelemetryData.SystemLoad`）、适配器输入、IOReport "Energy Model" 的 CPU / GPU / ANE / DRAM 功耗、最热的 `PMU tdie` 温度。
-- **电量记录**：每 5 分钟记一条到 `~/Library/Application Support/powerbar/history.csv`（保留 60 天），近 12 小时曲线（绿色 = 接电），本次用电池 / 接电时长，按近 14 天的常用功耗（去掉首尾 10%）估计续航。
+- **电量记录**：每 5 分钟记一条到 `~/Library/Application Support/powerbar/history.csv`（保留 60 天），近 12 小时曲线（绿色 = 接电），本次用电池 / 接电时长，按近 14 天的常用功耗（去掉首尾 10%）同时给出两个估计：电池可用时长、充满所需时长（接电或用电池时都显示）。
 - **记录窗口**：6 小时 / 24 小时 / 3 天 / 7 天 / 30 天 / 全部 / 自选区间的电量与功率曲线，灰色段 = 休眠或关机，指针悬停看读数，每段充放电明细。
 - **合盖不休眠**：`pmset -a disablesleep 1/0`。
 - 中文 / English 切换，深色模式。

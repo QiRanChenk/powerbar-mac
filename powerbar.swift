@@ -230,6 +230,28 @@ final class History {
         typCache[charging] = (samples.count, out)
         return out
     }
+    // Seconds until the battery is full. Charging slows down towards the end, so energy / usual watts is far too short
+    // for the last fifth. Per percent: the median time that percent took in the recorded charges when there are at
+    // least two of them, else the usual charging power, stretched above 80 % (power falling in a line to 15 % at 100 %).
+    private var paceCache: (count: Int, pace: [Int: Double]) = (-1, [:])
+    func secondsToFull(whLeft: Double, whFull: Double) -> (secs: Double, watts: Double)? {
+        guard let typ = typicalWatts(charging: true), whFull > 0 else { return nil }
+        if paceCache.count != samples.count {
+            var seen: [Int: [Double]] = [:]
+            for (p, s) in zip(samples, samples.dropFirst()) where p.ext && s.ext && !s.brk && s.t - p.t <= History.gap && s.pct > p.pct && s.w > 1 {
+                for q in p.pct..<s.pct { seen[q, default: []].append((s.t - p.t) / Double(s.pct - p.pct)) }
+            }
+            paceCache = (samples.count, seen.filter { $0.value.count >= 2 }.mapValues { v in v.sorted()[v.count / 2] })
+        }
+        let at = min(100, max(0, whLeft / whFull * 100)), first = Int(at)
+        var secs = 0.0
+        for q in first..<100 {
+            let slow = q < 80 ? 1 : 1 / (1 - 0.85 * (Double(q) + 0.5 - 80) / 20)
+            let one = paceCache.pace[q] ?? whFull / 100 / typ.watts * 3600 * slow
+            secs += one * (q == first ? 1 - (at - Double(first)) : 1)
+        }
+        return (secs, typ.watts)
+    }
 }
 // battery charge over the last 12 hours: green while on AC, the text colour on battery; breaks where the machine slept
 final class HistoryChart: NSView {
@@ -417,7 +439,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let history = History()
     let chart = HistoryChart()
     let axisL = label(size: 10, color: .tertiaryLabelColor), axisM = label(size: 10, color: .tertiaryLabelColor), axisR = label(size: 10, color: .tertiaryLabelColor)
-    let sessionLine = label(size: 12), historyLine = label(size: 12, color: .secondaryLabelColor)
+    let sessionLine = label(size: 12), historyLine = label(size: 12, color: .secondaryLabelColor), chargeLine = label(size: 12, color: .secondaryLabelColor)
     let recordsButton = NSButton(title: "", target: nil, action: nil)
     var recordsWindow: NSWindow?
     func hm(_ secs: Double) -> String { let m = Int((secs / 60).rounded()); return m >= 60 ? L("\(m / 60) 小时 \(m % 60) 分", "\(m / 60) h \(m % 60) min") : L("\(m) 分钟", "\(m) min") }
@@ -433,12 +455,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let cur = history.sessions().last {
             sessionLine.stringValue = (cur.ext ? L("本次接电已 ", "On AC for ") : L("本次用电池已 ", "On battery for ")) + hm(cur.active) + " · \(cur.pct0)% → \(cur.pct1)%"
         } else { sessionLine.stringValue = L("还没有记录", "No records yet") }
-        if !external, let t = history.typicalWatts(charging: false), let left = whLeft {
-            historyLine.stringValue = L("按历史用量还能用约 ", "At the usual rate: about ") + hm(left / t.watts * 3600) + String(format: L("（%.1f W）", " (%.1f W)"), t.watts)
-        } else if external, let t = history.typicalWatts(charging: true), let left = whLeft, let full = whFull, full - left > 0.5 {
-            historyLine.stringValue = L("按历史充电速度约 ", "At the usual rate: about ") + hm((full - left) / t.watts * 3600) + L(" 充满", " to full") + String(format: L("（%.0f W）", " (%.0f W)"), t.watts)
-        } else if external { historyLine.stringValue = L("已接电源", "On AC power") }
-        else { historyLine.stringValue = L("历史记录不足，用电池满半小时后给出估计", "Estimate after half an hour on battery") }
+        // Both estimates at once, whatever the power source: how long the charge would last on battery at the usual
+        // discharge power, and how long it takes to fill the battery at the usual charging power.
+        if let t = history.typicalWatts(charging: false), let left = whLeft {
+            historyLine.stringValue = L("电池可用约 ", "On battery: about ") + hm(left / t.watts * 3600) + String(format: L("（按历史 %.1f W）", " (usual %.1f W)"), t.watts)
+        } else { historyLine.stringValue = L("电池可用：记录不足，用电池满半小时后给出", "On battery: estimate after half an hour on battery") }
+        if let left = whLeft, let full = whFull, full - left <= 0.5 { chargeLine.stringValue = L("电池已充满", "Battery is full") }
+        else if let left = whLeft, let full = whFull, let t = history.secondsToFull(whLeft: left, whFull: full) {
+            chargeLine.stringValue = L("充满约需 ", "To full: about ") + hm(t.secs) + String(format: L("（按历史 %.0f W）", " (usual %.0f W)"), t.watts)
+        } else { chargeLine.stringValue = L("充满所需：记录不足，充电满半小时后给出", "To full: estimate after half an hour of charging") }
     }
     // ---- the records window: a chart of any stretch of the history, a summary of it and its sessions ----------------
     let rangeSeg = NSSegmentedControl(labels: ["", "", "", "", "", "", ""], trackingMode: .selectOne, target: nil, action: nil)
@@ -576,7 +601,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let opts = Card([hstack([lidLabel, spacer(), lidSwitch]), hstack([langButton, spacer(), quitButton])])
         recordsButton.bezelStyle = .rounded; recordsButton.controlSize = .small; recordsButton.target = self; recordsButton.action = #selector(showRecords)
         let axis = hstack([axisL, spacer(), axisM, spacer(), axisR])
-        let hist = Card([chart, axis, sessionLine, historyLine, hstack([spacer(), recordsButton])])
+        let hist = Card([chart, axis, sessionLine, historyLine, chargeLine, hstack([spacer(), recordsButton])])
         hist.stack.setCustomSpacing(2, after: chart)
         cards = [power, hist, opts]
 
