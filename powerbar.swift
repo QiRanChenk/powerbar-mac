@@ -3,8 +3,7 @@
 // System: AppleSmartBattery PowerTelemetryData SystemLoad (mW, what the whole machine draws, on AC or battery).
 // SoC: IOReport "Energy Model" counters (CPU / GPU / ANE / DRAM energy), turned into watts between two samples.
 // Temperature: hottest "PMU tdie" sensor from the HID event system.
-// Power mode: writes the choice to /Users/Shared/powerbar/mode ("auto" | "on" | "off" for Low Power Mode) and
-// /Users/Shared/powerbar/lid ("awake" | "sleep"); the root service pbd applies them with pmset.
+// Lid: writes /Users/Shared/powerbar/lid ("awake" | "sleep"); the root service pbd applies it with pmset.
 // History: one sample every five minutes in ~/Library/Application Support/powerbar/history.csv (60 days), a 12-hour
 // chart in the menu and a records window with a chart of any range. The menu is one panel of cards.
 import Cocoa
@@ -180,8 +179,16 @@ final class History {
     // changes or when forced (going to sleep)
     func add(pct: Int, wh: Double?, w: Double, ext: Bool, force: Bool = false) {
         if readOnly { return }
-        accW += w; accN += 1; last = (pct, wh, ext)
         let now = Date().timeIntervalSince1970
+        // The power source changed: what was gathered so far belongs to the old one. It is written under the old source
+        // (it used to go out under the new one, so a battery stretch began with a charging sample and its average came
+        // out several watts low), and the new stretch starts with this reading.
+        if let le = lastExt, le != ext, accN > 0, let l = last, !pendingBreak, samples.last.map({ now - 1 > $0.t }) ?? true {
+            let old = Sample(t: now - 1, pct: l.pct, wh: l.wh ?? 0, w: accW / Double(accN), ext: le, brk: false)
+            samples.append(old); accW = 0; accN = 0
+            if !readOnly, let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(History.line(old).data(using: .utf8)!); h.closeFile() }
+        }
+        accW += w; accN += 1; last = (pct, wh, ext)
         guard force || pendingBreak || now - lastWrite >= History.interval || (lastExt != nil && lastExt != ext) else { return }
         if let l = samples.last, now <= l.t { return }
         let smp = Sample(t: now, pct: pct, wh: wh ?? 0, w: accW / Double(accN), ext: ext, brk: pendingBreak)
@@ -202,7 +209,8 @@ final class History {
                 out.append(Session(start: s.t, end: s.t, ext: s.ext, active: 0, pct0: s.pct, pct1: s.pct, wh0: s.wh, wh1: s.wh, wsum: 0, n: 0))
             } else if let p = prev, !s.brk, s.t - p.t <= History.gap { out[out.count - 1].active += s.t - p.t }
             out[out.count - 1].end = s.t; out[out.count - 1].pct1 = s.pct; out[out.count - 1].wh1 = s.wh
-            if abs(s.w) < 150 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
+            // a sample whose sign contradicts its source (written at a switch by the versions before the fix) is no part of the average
+            if abs(s.w) < 150, s.ext ? s.w > -0.5 : s.w < 0.5 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
             prev = s
         }
         return out
@@ -516,13 +524,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let sysLine = label(size: 12, color: .secondaryLabelColor, mono: true)
     let socLine = label(size: 12, color: .secondaryLabelColor, mono: true)
 
-    // Low Power Mode, applied by the root service pbd (pmset -b / -c lowpowermode)
-    let presets: [(zh: String, en: String, mode: String)] = [("自动", "Auto", "auto"), ("低电量", "Low Power", "on"), ("正常", "Normal", "off")]
-    let modeSeg = NSSegmentedControl(labels: ["", "", ""], trackingMode: .selectOne, target: nil, action: nil)
-    let modeHint = label(size: 11, color: .secondaryLabelColor)
-    let modeLine = label(size: 11, color: .secondaryLabelColor)
-    var pendingMode: String? = nil  // chosen but not yet applied by the service
-
     // options
     let lidSwitch = NSSwitch()
     let lidLabel = label(size: 12)
@@ -538,25 +539,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? (s + "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
 
-    // ---- power mode ----
-    @objc func pickPreset(_ s: NSSegmentedControl) { let m = presets[s.selectedSegment].mode; writeLine(modeDir + "/mode", m); pendingMode = m; refreshMode() }
-    func refreshMode() {
-        let m = readLine(modeDir + "/mode")
-        modeSeg.selectedSegment = presets.firstIndex { $0.mode == m } ?? -1
-        let hints = [L("插电时正常性能，用电池时低电量模式", "Normal on AC, Low Power Mode on battery"),
-                     L("插电和电池都用低电量模式", "Low Power Mode on AC and on battery"),
-                     L("始终正常性能", "Never Low Power Mode")]
-        if let i = presets.firstIndex(where: { $0.mode == m }) { modeHint.stringValue = hints[i] }
-        else { modeHint.stringValue = L("未选择：按系统设置里的低电量模式", "Not chosen: as set in System Settings") }
-        // status written by the service: "<mode> <battery lpm 0|1> <ac lpm 0|1>"
-        let st = readLine(modeDir + "/status").split(separator: " ").map(String.init)
-        let alive = st.count >= 3
-        if alive && st[0] == m { pendingMode = nil }
-        let now = ProcessInfo.processInfo.isLowPowerModeEnabled ? L("低电量模式", "Low Power Mode") : L("正常性能", "normal performance")
-        if pendingMode != nil { modeLine.stringValue = alive ? L("正在应用…", "applying…") : L("服务未运行", "service not running") }
-        else { modeLine.stringValue = L("当前：", "Now: ") + now + (alive ? "" : L("（服务未运行）", " (service not running)")) }
-    }
-
     // ---- lid ----
     func lidAwake() -> Bool { readLine(modeDir + "/lid") == "awake" }
     @objc func toggleLid(_ s: NSSwitch) { writeLine(modeDir + "/lid", s.state == .on ? "awake" : "sleep") }
@@ -565,15 +547,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleLanguage() { english.toggle(); UserDefaults.standard.set(english, forKey: "english"); relabel(); tick(); resize() }
     @objc func quit() { NSApp.terminate(nil) }
     func relabel() {
-        let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("性能模式", "POWER MODE"), L("选项", "OPTIONS")]
+        let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("选项", "OPTIONS")]
         axisL.stringValue = L("12 小时前", "12 h ago"); axisM.stringValue = L("绿色 = 接电", "green = on AC"); axisR.stringValue = L("现在", "now")
         recordsButton.title = L("记录曲线与明细…", "Chart and records…"); recordsCount = -1; refreshRecords()
         for (i, c) in cards.enumerated() { c.caption.stringValue = caps[i] }
-        for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
         lidLabel.stringValue = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
         langButton.title = english ? "中文" : "English"
         quitButton.title = L("退出 powerbar", "Quit powerbar")
-        refreshMode()
     }
     func resize() {
         panel.layoutSubtreeIfNeeded()
@@ -589,10 +569,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let power = Card([top, battState, timeLine, sysLine, socLine])
         power.stack.setCustomSpacing(2, after: top); power.stack.setCustomSpacing(6, after: battState)
         power.stack.setCustomSpacing(4, after: sysLine)
-        // power mode card
-        modeSeg.target = self; modeSeg.action = #selector(pickPreset(_:)); modeSeg.segmentDistribution = .fillEqually; modeSeg.controlSize = .small
-        let mode = Card([modeSeg, modeHint, modeLine])
-        mode.stack.setCustomSpacing(4, after: modeHint)
         // options card
         lidSwitch.controlSize = .mini; lidSwitch.target = self; lidSwitch.action = #selector(toggleLid(_:))
         for b in [langButton, quitButton] { b.bezelStyle = .rounded; b.controlSize = .small; b.target = self }
@@ -602,7 +578,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let axis = hstack([axisL, spacer(), axisM, spacer(), axisR])
         let hist = Card([chart, axis, sessionLine, historyLine, hstack([spacer(), recordsButton])])
         hist.stack.setCustomSpacing(2, after: chart)
-        cards = [power, hist, mode, opts]
+        cards = [power, hist, opts]
 
         panel.orientation = .vertical; panel.alignment = .leading; panel.spacing = 8
         panel.setHuggingPriority(.required, for: .vertical)
@@ -621,8 +597,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wsn = NSWorkspace.shared.notificationCenter
         wsn.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.history.willSleep() }
         wsn.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.history.didWake() }
-        // Low Power Mode changed elsewhere (System Settings, Control Center): show it at once
-        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in self?.refreshMode() }
         // .common: the panel keeps updating while the menu is open
         let t = Timer(timeInterval: 2, repeats: true) { _ in self.tick() }
         RunLoop.main.add(t, forMode: .common)
@@ -672,7 +646,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             socLine.stringValue = t
         } else { socLine.stringValue = L("读不到 SoC 功耗", "No SoC power data") }
         item.button?.title = title
-        refreshMode()
         lidSwitch.state = lidAwake() ? .on : .off
     }
 }
